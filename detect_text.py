@@ -13,7 +13,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with MLSP_project. If not, see <http://www.gnu.org/licenses/>.
 
-from LangaugeModel.dataset import AlignCollate
 import argparse
 import os
 import time
@@ -26,9 +25,10 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 
-from .CRAFT import craft, craft_utils, imgproc, file_utils
-from .LangaugeModel import model
-from .LangaugeModel.utils import AttnLabelConverter, CTCLabelConverter
+from CRAFT import craft, craft_utils, file_utils, imgproc
+from LangaugeModel import model
+from LangaugeModel.dataset import AlignCollate, RawDataset
+from LangaugeModel.utils import AttnLabelConverter, CTCLabelConverter
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -69,7 +69,7 @@ def test_net(
     # preprocessing
     x = imgproc.normalizeMeanVariance(img_resized)
     x = torch.from_numpy(x).permute(2, 0, 1)  # [h, w, c] to [c, h, w]
-    x = torch.Variable(x.unsqueeze(0))  # [c, h, w] to [b, c, h, w]
+    x = torch.autograd.Variable(x.unsqueeze(0))  # [c, h, w] to [b, c, h, w]
     if cuda:
         x = x.cuda()
 
@@ -150,10 +150,12 @@ def crop(pts, image):
     Takes inputs as 8 points
     and Returns cropped, masked image with a white background
     """
+    pts = pts.astype(int)
     rect = cv2.boundingRect(pts)
     x, y, w, h = rect
     cropped = image[y : y + h, x : x + w].copy()
     pts = pts - pts.min(axis=0)
+    # print(pts.shape)
     mask = np.zeros(cropped.shape[:2], np.uint8)
     cv2.drawContours(mask, [pts], -1, (255, 255, 255), -1, cv2.LINE_AA)
     dst = cv2.bitwise_and(cropped, cropped, mask=mask)
@@ -303,14 +305,14 @@ parser.add_argument(
 args = parser.parse_args()
 
 if __name__ == "__main__":
-    data = pd.DataFrame(
-        columns=["image_name", "word_bboxes", "pred_words", "align_text"]
-    )
+    data = pd.DataFrame(columns=["image_name", "word_bboxes", "pred_words"])
 
     print("Fetching file names")
-    for file in os.listdir(args.test_folder):
+    for file in sorted(os.listdir(args.test_folder)):
         if os.path.splitext(file)[1] in ALLOWED_IMAGE_FORMATS:
             files.append(os.path.join(args.test_folder, file))
+
+    files = files
 
     if not os.path.isdir(args.output_folder):
         try:
@@ -335,10 +337,7 @@ if __name__ == "__main__":
         cudnn.benchmark = False
         args.num_gpu = torch.cuda.device_count()
 
-    nlp_net = model.Model(args)
-    print(f"Loading NLP weights from {args.nlp_model}")
-    nlp_net.load_state_dict(torch.load(args.nlp_model, map_location=device))
-
+    net.to(device)
     aligncollate = AlignCollate(args.imgH, args.imgW, args.PAD)
 
     if "CTC" in args.Prediction:
@@ -347,6 +346,19 @@ if __name__ == "__main__":
         converter = AttnLabelConverter(args.character)
 
     args.num_class = len(converter.character)
+
+    nlp_net = model.Model(args)
+    print(f"Loading NLP weights from {args.nlp_model}")
+    state_dict = torch.load(args.nlp_model, map_location=device)
+
+    new_state_dict = OrderedDict()
+
+    for k, v in state_dict.items():
+        name = k[7:]
+        new_state_dict[name] = v
+    nlp_net.load_state_dict(new_state_dict)
+
+    nlp_net.to(device)
 
     t = time.time()
     for k, image_path in enumerate(files):
@@ -370,8 +382,10 @@ if __name__ == "__main__":
             item = bboxes[box_num]
             bbox_score[key] = item
 
-        data["word_bboxes"][k] = bbox_score
+        # data["word_bboxes"][k] = bbox_score
+
         # save score text
+        print("Saving the image and mask")
         filename, file_ext = os.path.splitext(os.path.basename(image_path))
         mask_file = os.path.join(args.output_folder, filename + "_mask.jpg")
         cv2.imwrite(mask_file, score_text)
@@ -381,31 +395,52 @@ if __name__ == "__main__":
         )
 
         rectangles = []
+        crop_folder = os.path.join(args.output_folder, filename)
 
-        for crop_no, confidence, coords in enumerate(bbox_score.items()):
+        saved_coords = {}
+        if not os.path.isdir(crop_folder):
+            os.makedirs(crop_folder)
+        for crop_no, (confidence, coords) in enumerate(bbox_score.items()):
+            coords[coords < 0] = 0
             print(
-                f"Text here, confidence: {confidence}, coords: {list(coords)}"
+                f"Found text, confidence: {confidence}, coords: {list(coords)}"
             )
             cropped_image = crop(coords, image)
+            crop_path = os.path.join(
+                crop_folder, filename + f"_crop_{crop_no}.jpg"
+            )
+            cv2.imwrite(crop_path, cropped_image)
+            saved_coords[crop_path] = coords
+            print(f"Saved to {crop_path}")
 
-            with torch.no_grad():
-                cropped_image = (
-                    torch.tensor(cropped_image).unsqueeze(0).to(device)
-                )
-                cropped_image, _ = aligncollate((cropped_image, ["A"]))
+        demo_data = RawDataset(root=crop_folder, opt=args)  # use RawDataset
+        demo_loader = torch.utils.data.DataLoader(
+            demo_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            collate_fn=aligncollate,
+            pin_memory=True,
+        )
+        nlp_net.eval()
+        with torch.no_grad():
+            for image_tensors, image_path_list in demo_loader:
+                print("Here!!")
+                batch_size = image_tensors.size(0)
+                cropped_image = image_tensors.to(device)
 
-                length_for_pred = torch.IntTensor([args.batch_max_length]).to(
-                    device
-                )
+                length_for_pred = torch.IntTensor(
+                    [args.batch_max_length] * batch_size
+                ).to(device)
                 text_for_pred = (
-                    torch.zeros((1, args.batch_max_lenght + 1))
+                    torch.zeros((batch_size, args.batch_max_length + 1))
                     .long()
                     .to(device)
                 )
 
                 if "CTC" in args.Prediction:
                     preds = nlp_net(cropped_image, text_for_pred)
-                    preds_size = torch.IntTensor([preds.size(1)])
+                    preds_size = torch.IntTensor([preds.size(1)] * batch_size)
                     _, preds_index = preds.max(2)
                     preds_str = converter.decode(preds_index, preds_size)
                 else:
@@ -417,25 +452,39 @@ if __name__ == "__main__":
 
                 preds_prob = F.softmax(preds, 2)
                 preds_max_prob, _ = preds_prob.max(dim=2)
-                pred = preds[0]
-                pred_max_prob = preds_max_prob[0]
-                if "Attn" in args.Prediction:
-                    pred_EOS = pred.find("[s]")
-                    pred = pred[:pred_EOS]
-                    pred_max_prob = preds_max_prob[:pred_EOS]
+                for img_name, pred, pred_max_prob in zip(
+                    image_path_list, preds_str, preds_max_prob
+                ):
+                    if "Attn" in args.Prediction:
+                        pred_EOS = pred.find("[s]")
+                        pred = pred[:pred_EOS]
+                        pred_max_prob = preds_max_prob[:pred_EOS]
 
-                confidence_score = pred_max_prob.cumprod(0)[-1]
-                print(
-                    "prediction: {pred:25s}, confidence: {confidence_score:0.4f}"
-                )
-                rectangles.append((coords, f"{pred} {confidence_score}"))
+                    confidence_score = pred_max_prob.cumprod(0)[-1]
+                    coords = saved_coords[img_name]
+
+                    print(f"pred: {pred}, confidence: {confidence_score:0.4f}")
+                    rectangles.append(
+                        (coords, f"{pred} {confidence_score:0.4f}")
+                    )
+                    data = data.append(
+                        {
+                            "image_name": filename,
+                            "word_bboxes": coords,
+                            "pred_words": pred,
+                        },
+                        ignore_index=True,
+                    )
+
         image_output_path = os.path.join(
             args.output_folder,
-            os.path.split(image_path)[1].splitext()[0] + "_labelled.jpg",
+            os.path.splitext(os.path.split(image_path)[1])[0]
+            + "_labelled.jpg",
         )
         drawBoundingBoxes(
             image, image_output_path, rectangles, color=(255, 255, 255)
         )
+        print("")
 
     data.to_csv("./data.csv", sep=",", na_rep="Unknown")
     print("Average time : {}s".format((time.time() - t) / len(files)))
