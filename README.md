@@ -17,6 +17,17 @@
 
 # Scene Text Recognition
 
+## Credits
+This is based on the following repos/blog post:
+
+1. https://github.com/clovaai/deep-text-recognition-benchmark
+
+1. https://github.com/clovaai/CRAFT-pytorch
+
+1. https://github.com/thtrieu/darkflow
+
+1. https://towardsdatascience.com/pytorch-scene-text-detection-and-recognition-by-craft-and-a-four-stage-network-ec814d39db05
+
 ## Usage Instructions
 Open MLSP_Project_Test.ipynb in a colab environment and run all the cells.
 
